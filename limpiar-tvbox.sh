@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# limpiar-tvbox: analiza y limpia TV box Android genéricos que traen malware de fábrica.
+#
+# Corre en la computadora (macOS o Linux) y maneja el equipo por ADB. El trabajo pesado lo hace
+# dispositivo.sh dentro del equipo y en segundo plano, porque el ADB por Wi-Fi de estos equipos
+# se corta seguido. Ver README.md.
+
+set -u
+
+DIR=$(cd "$(dirname "$0")" && pwd)
+REMOTO=/data/local/tmp/limpiar-tvbox
+PUERTO=5555
+
+MODO=analizar
+IP=""
+ESPERAR=0
+QUITAR_APPS=0
+OPTIMIZAR=0
+CERRAR_ADB=0
+REINICIAR=1
+LAUNCHER=1
+
+ayuda() {
+  cat <<'EOF'
+Uso: ./limpiar-tvbox.sh [opciones]
+
+Sin opciones, busca el equipo en la red y lo ANALIZA: no cambia nada.
+
+  --limpiar         Neutraliza el malware y lo demás que encuentre. Antes copia cada archivo
+                    que toca a informes/<equipo>/cuarentena.
+  --ip IP           IP del equipo. Sin esto, lo busca solo en la red.
+  --esperar         Espera a que el equipo abra el ADB (usalo justo después de prenderlo).
+  --quitar-apps     Con --limpiar: desinstala TODAS las apps no del sistema (las piratas
+                    incluidas). Las que quieras, después las instalás desde Play Store.
+  --optimizar       Con --limpiar: animaciones más rápidas y TalkBack apagado si no se usa.
+  --cerrar-adb      Con --limpiar: al terminar, cierra el ADB por red (recomendado si no vas a
+                    volver a entrar; abierto, cualquiera en tu red puede tener root).
+  --sin-launcher    Con --limpiar: no instala Vidrio Launcher (por defecto se instala y queda
+                    como pantalla de inicio).
+  --sin-reinicio    No reinicia al final para verificar.
+  -h, --ayuda       Esta ayuda.
+
+Ejemplos:
+  ./limpiar-tvbox.sh                                # solo mirar
+  ./limpiar-tvbox.sh --limpiar --esperar            # limpiar; prender el equipo después
+  ./limpiar-tvbox.sh --limpiar --quitar-apps --optimizar --cerrar-adb --ip 192.168.0.50
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --limpiar) MODO=limpiar ;;
+    --ip) IP=${2:-}; shift ;;
+    --esperar) ESPERAR=1 ;;
+    --quitar-apps) QUITAR_APPS=1 ;;
+    --optimizar) OPTIMIZAR=1 ;;
+    --cerrar-adb) CERRAR_ADB=1 ;;
+    --sin-launcher) LAUNCHER=0 ;;
+    --sin-reinicio) REINICIAR=0 ;;
+    -h|--ayuda|--help) ayuda; exit 0 ;;
+    *) echo "Opción desconocida: $1" >&2; ayuda; exit 2 ;;
+  esac
+  shift
+done
+
+paso() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+aviso() { printf '  %s\n' "$*"; }
+fallar() { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+
+for c in adb nc; do
+  command -v $c >/dev/null || fallar "Falta '$c'. En macOS: brew install android-platform-tools. En Linux: apt install adb netcat-openbsd."
+done
+[ -f "$DIR/dispositivo.sh" ] && [ -f "$DIR/indicadores.txt" ] || fallar "Faltan dispositivo.sh o indicadores.txt junto a este script."
+
+# Corre un comando con tope de segundos (macOS no trae `timeout`).
+con_limite() {
+  local s=$1; shift
+  "$@" & local pid=$!
+  ( sleep "$s"; kill "$pid" 2>/dev/null ) & local vigia=$!
+  wait "$pid" 2>/dev/null; local r=$?
+  kill "$vigia" 2>/dev/null; wait "$vigia" 2>/dev/null
+  return $r
+}
+
+# Los primeros tres números de la IP de esta computadora (192.168.0, por ejemplo).
+subred() {
+  local ip=""
+  if command -v ip >/dev/null; then
+    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1)}')
+  fi
+  if [ -z "$ip" ] && command -v route >/dev/null; then
+    local interfaz
+    interfaz=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+    [ -n "$interfaz" ] && ip=$(ipconfig getifaddr "$interfaz" 2>/dev/null)
+  fi
+  echo "${ip%.*}"
+}
+
+# Imprime las IP con el ADB abierto en la red, una por línea: las que se anuncian por mDNS y
+# las que responden en el puerto.
+buscar() {
+  {
+    adb mdns services 2>/dev/null | awk '/_adb._tcp/ {split($3, a, ":"); print a[1]}'
+    local base; base=$(subred)
+    if [ -n "$base" ]; then
+      for i in $(seq 1 254); do
+        ( nc -z -w 1 "$base.$i" $PUERTO >/dev/null 2>&1 && echo "$base.$i" ) &
+      done
+      wait
+    fi
+  } | sort -u
+}
+
+encontrar_equipo() {
+  if [ -n "$IP" ] && [ $ESPERAR = 0 ]; then return; fi
+  local limite=1
+  [ $ESPERAR = 1 ] && limite=100
+  [ $ESPERAR = 1 ] && aviso "Esperando a que abra el ADB (hasta 5 minutos)…"
+  for _ in $(seq 1 $limite); do
+    if [ -n "$IP" ]; then
+      nc -z -w 1 "$IP" $PUERTO >/dev/null 2>&1 && return
+    else
+      local halladas; halladas=$(buscar)
+      case $(echo "$halladas" | grep -c .) in
+        0) ;;
+        1) IP=$halladas; return ;;
+        *) fallar "Hay más de un equipo con ADB en la red; elegí cuál con --ip:
+$(echo "$halladas" | sed 's/^/  /')" ;;
+      esac
+    fi
+    [ $limite -gt 1 ] && sleep 3
+  done
+  [ -z "$IP" ] && fallar "No encontré ningún equipo con ADB abierto en la red. ¿Está activada la depuración? ¿Probaste con --esperar justo después de prenderlo?"
+  fallar "El equipo $IP no tiene el ADB abierto."
+}
+
+conectar() {
+  D="$IP:$PUERTO"
+  adb disconnect "$D" >/dev/null 2>&1
+  con_limite 10 adb connect "$D" >/dev/null 2>&1
+  local estado
+  for _ in $(seq 1 30); do
+    estado=$(adb devices | awk -v d="$D" '$1 == d {print $2}')
+    case $estado in
+      device) return 0 ;;
+      unauthorized) aviso "En la tele apareció \"¿Permitir la depuración?\": aceptalo con el control." ;;
+      *) con_limite 10 adb connect "$D" >/dev/null 2>&1 ;;
+    esac
+    sleep 2
+  done
+  return 1
+}
+
+# Comando como root, por su o por `adb root`. Sin comillas simples adentro.
+ROOT=""
+rsh() {
+  if [ "$ROOT" = su ]; then adb -s "$D" shell "su -c '$1'"
+  else adb -s "$D" shell "$1"
+  fi
+}
+
+detectar_root() {
+  if adb -s "$D" shell "su -c id" 2>/dev/null | grep -q 'uid=0'; then ROOT=su; return 0; fi
+  if adb -s "$D" shell id 2>/dev/null | grep -q 'uid=0'; then ROOT=adb; return 0; fi
+  if adb -s "$D" root 2>/dev/null | grep -qiE 'restarting|already'; then
+    sleep 3
+    conectar && adb -s "$D" shell id | grep -q 'uid=0' && { ROOT=adb; return 0; }
+  fi
+  return 1
+}
+
+# Lo primero apenas se entra: frenar los servicios conocidos, que cierran el ADB al rato.
+frenar_conocidos() {
+  local servicios
+  servicios=$(grep -E '^servicio[[:space:]]' "$DIR/indicadores.txt" | sed -E 's/#.*//' | awk '{print $2}' | tr '\n' ' ')
+  [ -z "$servicios" ] && return
+  rsh "for s in $servicios; do setprop ctl.stop \$s; for p in \$(pidof \$s); do kill -9 \$p; done; done" >/dev/null 2>&1
+}
+
+reconectar() {
+  adb disconnect "$D" >/dev/null 2>&1
+  con_limite 10 adb connect "$D" >/dev/null 2>&1
+}
+
+# Sigue el informe a medida que dispositivo.sh lo escribe, reconectando si el ADB se corta.
+seguir_informe() {
+  local vistas=0 total t=0
+  while [ $t -lt 1800 ]; do
+    sleep 4; t=$((t + 4))
+    if ! adb -s "$D" shell true >/dev/null 2>&1; then reconectar; continue; fi
+    total=$(adb -s "$D" shell "cat $REMOTO/informe.txt 2>/dev/null | wc -l" | tr -dc '0-9')
+    if [ -n "$total" ] && [ "$total" -gt "$vistas" ]; then
+      adb -s "$D" shell "sed -n '$((vistas + 1)),${total}p' $REMOTO/informe.txt" | tr -d '\r' | sed 's/^/  /'
+      vistas=$total
+    fi
+    adb -s "$D" shell "ls $REMOTO/listo 2>/dev/null" | grep -q listo && return 0
+  done
+  return 1
+}
+
+# Vidrio Launcher: liviano, sin publicidad ni recomendaciones, en apks/. Queda como pantalla de
+# inicio; el permiso DUMP es para su tarjeta de música en equipos que se declaran de poca memoria.
+instalar_launcher() {
+  local apk="$DIR/apks/vidrio-launcher.apk"
+  [ -f "$apk" ] || { aviso "No está apks/vidrio-launcher.apk; sigo sin launcher."; return; }
+  if ! con_limite 120 adb -s "$D" install -r "$apk" >/dev/null 2>&1; then
+    aviso "No pude instalar Vidrio Launcher; el resto de la limpieza quedó hecho."
+    return
+  fi
+  adb -s "$D" shell "cmd package set-home-activity com.augusto.vidrio/.MainActivity" >/dev/null 2>&1
+  adb -s "$D" shell "pm grant com.augusto.vidrio android.permission.DUMP" >/dev/null 2>&1
+  aviso "✓ Vidrio Launcher instalado y elegido como pantalla de inicio."
+}
+
+# ---------------------------------------------------------------------------------------------
+paso "1. Buscando el equipo"
+encontrar_equipo
+aviso "Equipo en $IP"
+conectar || fallar "No pude conectarme a $IP:$PUERTO."
+
+paso "2. Acceso root"
+detectar_root || fallar "El equipo no da root (ni su ni adb root). Este script está pensado para TV box genéricos con firmware de fábrica, que lo traen."
+aviso "Root por: $ROOT"
+frenar_conocidos
+
+MODELO=$(adb -s "$D" shell getprop ro.product.model | tr -d '\r' | tr -c 'A-Za-z0-9_-' '_')
+SALIDA="$DIR/informes/$(date +%Y%m%d-%H%M)-${MODELO:-equipo}"
+mkdir -p "$SALIDA"
+
+paso "3. $( [ $MODO = limpiar ] && echo Limpiando || echo Analizando ) (corre dentro del equipo; si el ADB se corta, sigue igual)"
+rsh "rm -rf $REMOTO; mkdir -p $REMOTO; chmod 777 $REMOTO" >/dev/null
+adb -s "$D" push "$DIR/dispositivo.sh" "$DIR/indicadores.txt" "$REMOTO/" >/dev/null || fallar "No pude copiar los scripts al equipo."
+rsh "nohup sh $REMOTO/dispositivo.sh $MODO $QUITAR_APPS $OPTIMIZAR $CERRAR_ADB >/dev/null 2>&1 &" >/dev/null 2>&1
+seguir_informe || aviso "No terminó en 30 minutos; el informe parcial queda igual."
+
+paso "4. Trayendo el informe"
+adb -s "$D" pull "$REMOTO/informe.txt" "$SALIDA/" >/dev/null 2>&1
+if [ $MODO = limpiar ]; then
+  adb -s "$D" pull "$REMOTO/cuarentena" "$SALIDA/" >/dev/null 2>&1
+fi
+rsh "rm -rf $REMOTO" >/dev/null 2>&1
+aviso "Informe: $SALIDA/informe.txt"
+[ -d "$SALIDA/cuarentena" ] && aviso "Copias de lo modificado: $SALIDA/cuarentena"
+
+if [ $MODO = analizar ]; then
+  paso "Listo. No se modificó nada."
+  aviso "Para limpiar: ./limpiar-tvbox.sh --limpiar --ip $IP"
+  exit 0
+fi
+
+if [ $LAUNCHER = 1 ]; then
+  paso "5. Instalando Vidrio Launcher"
+  instalar_launcher
+fi
+
+if [ $REINICIAR = 1 ]; then
+  paso "6. Reiniciando para verificar"
+  adb -s "$D" reboot >/dev/null 2>&1
+  sleep 25
+  # Si la MAC no se pudo fijar, puede volver con otra IP.
+  ANTERIOR=$IP; IP=""; ESPERAR=1
+  nc -z -w 1 "$ANTERIOR" $PUERTO >/dev/null 2>&1 && IP=$ANTERIOR
+  encontrar_equipo
+  conectar && detectar_root || fallar "Después del reinicio no pude volver a entrar. Revisá $SALIDA/informe.txt."
+  sleep 20
+
+  servicios=$(grep -E '^servicio[[:space:]]' "$DIR/indicadores.txt" | sed -E 's/#.*//' | awk '{print $2}')
+  bien=1
+  for s in $servicios; do
+    if [ -n "$(rsh "pidof $s" | tr -d '\r')" ]; then aviso "✗ $s volvió a arrancar"; bien=0
+    else aviso "✓ $s no arrancó"; fi
+  done
+  restos=$(rsh "ls /data/adb 2>/dev/null" | tr -d '\r')
+  for e in $(grep -E '^adb[[:space:]]' "$DIR/indicadores.txt" | sed -E 's/#.*//' | awk '{print $2}'); do
+    echo "$restos" | grep -qxE "$e(\.tar|\.lock)?" && { aviso "✗ /data/adb/$e reapareció"; bien=0; }
+  done
+  [ $bien = 1 ] && aviso "✓ /data/adb sin proxyware"
+  [ "$IP" != "$ANTERIOR" ] && aviso "Volvió con otra IP: $IP"
+fi
+
+if [ $CERRAR_ADB = 1 ]; then
+  paso "Cerrando el ADB por red"
+  rsh "settings put global adb_enabled 0" >/dev/null 2>&1
+  aviso "Para volver a entrar: Opciones de desarrollador → Depuración USB."
+fi
+
+paso "Listo."
+aviso "Si el equipo tuvo cuentas iniciadas (Google, Netflix, etc.), cambiá esas contraseñas desde otro dispositivo."

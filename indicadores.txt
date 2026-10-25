@@ -1,0 +1,40 @@
+# Indicadores de malware en TV box Android genéricos (Amlogic/Rockchip con firmware de fábrica).
+#
+# Una entrada por línea: <tipo> <valor>. Lo que sigue a un # es comentario.
+# Si encontrás algo nuevo en tu equipo, sumalo acá y mandá un pull request.
+#
+#   servicio  nombre del servicio de arranque (init) o de su binario. Se frena y se neutraliza.
+#   paquete   app de sistema que se desactiva con `pm disable` (reversible con `pm enable`).
+#   adb       entrada de /data/adb que deja el proxyware: se borra (también <valor>.tar y <valor>.lock).
+#   dominio   servidor de control; se busca dentro de binarios para detectar programas emparentados.
+
+# --- Botnet de proxy residencial "daemon12138" (familia tipo BadBox) -------------------------
+# Go, corre como root con contexto su. Se reporta a los dominios de abajo, revende la conexión
+# como proxy ("ipfly"), maneja un Chrome oculto y baja los SDK de /data/adb.
+servicio daemon12138
+
+dominio ooyy.online
+dominio pansy.pw
+dominio aibigdatausa.com
+dominio supbox.xyz
+
+# --- SDK de "compartir ancho de banda" que baja daemon12138 -----------------------------------
+adb CastarSdk
+adb earnsdk        # EarnFM
+adb pawns          # Pawns.app
+adb packet_sdk     # PacketStream
+adb hg             # Honeygain
+adb tr2            # Traffmonetizer
+adb dns
+adb onlinesdk
+adb prebuilt       # binarios del propio daemon (ray, main, zto) y sus registros
+adb init.sh        # lanzador que descarga y monta cada SDK
+adb init_b.sh      # variante que además ejecuta un script remoto
+adb resolv.conf
+
+# --- Apps de sistema ---------------------------------------------------------------------------
+paquete com.oranth.accessibility    # "AtvWidegtUI": registra un servicio de accesibilidad
+paquete io.rkupdates                # "RkUpdate": actualizador de Rockchip en equipos Amlogic
+paquete com.khy.videotest
+paquete com.DeviceTest              # arranca solo en cada inicio con permisos de sistema
+paquete com.droidlogic.otaupgrade   # OTA del fabricante: una "actualización" puede devolver el malware
