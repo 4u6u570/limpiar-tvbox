@@ -20,6 +20,7 @@ CERRAR_ADB=0
 REINICIAR=1
 LAUNCHER=1
 APPS=1
+ZONA=""
 
 ayuda() {
   cat <<'EOF'
@@ -40,6 +41,8 @@ Sin opciones, busca el equipo en la red y lo ANALIZA: no cambia nada.
                     TuneIn).
   --sin-launcher    Con --limpiar: no instala Vidrio Launcher (por defecto se instala y queda
                     como pantalla de inicio).
+  --zona ZONA       Con --limpiar: fija la zona horaria (por ejemplo America/Argentina/Salta).
+                    Muchos vienen con la de Londres o la de China y muestran mal la hora.
   --sin-reinicio    No reinicia al final para verificar.
   -h, --ayuda       Esta ayuda.
 
@@ -60,6 +63,7 @@ while [ $# -gt 0 ]; do
     --cerrar-adb) CERRAR_ADB=1 ;;
     --sin-apps) APPS=0 ;;
     --sin-launcher) LAUNCHER=0 ;;
+    --zona) ZONA=${2:-}; shift ;;
     --sin-reinicio) REINICIAR=0 ;;
     -h|--ayuda|--help) ayuda; exit 0 ;;
     *) echo "Opción desconocida: $1" >&2; ayuda; exit 2 ;;
@@ -297,6 +301,16 @@ instalar_launcher() {
     aviso "No pude instalar Vidrio Launcher; el resto de la limpieza quedó hecho."
     return
   fi
+  # Los launchers de fábrica se desactivan (reversible con pm enable): si no, después de
+  # reiniciar Android puede volver a elegirlos. Configuración tiene su propia pantalla de
+  # inicio de respaldo, así que el equipo nunca queda sin una.
+  local otros p
+  otros=$(adb -s "$D" shell "cmd package query-activities -a android.intent.action.MAIN -c android.intent.category.HOME" 2>/dev/null \
+    | tr -d '\r' | awk -F= '/^ +packageName=/ {print $2}' | sort -u)
+  for p in $otros; do
+    case $p in com.augusto.vidrio|com.android.tv.settings|com.android.settings|android) continue ;; esac
+    adb -s "$D" shell "pm disable-user --user 0 $p" >/dev/null 2>&1 && aviso "Launcher de fábrica desactivado: $p (se revierte con: pm enable $p)"
+  done
   adb -s "$D" shell "cmd package set-home-activity com.augusto.vidrio/.MainActivity" >/dev/null 2>&1
   adb -s "$D" shell "pm grant com.augusto.vidrio android.permission.DUMP" >/dev/null 2>&1
   adb -s "$D" shell "am start -a android.intent.action.MAIN -c android.intent.category.HOME" >/dev/null 2>&1
@@ -338,6 +352,11 @@ if [ $MODO = analizar ]; then
   paso "Listo. No se modificó nada."
   aviso "Para limpiar: ./limpiar-tvbox.sh --limpiar --ip $IP"
   exit 0
+fi
+
+if [ -n "$ZONA" ]; then
+  rsh "settings put global auto_time 1; settings put global auto_time_zone 0; setprop persist.sys.timezone $ZONA; service call alarm 3 s16 $ZONA" >/dev/null 2>&1
+  aviso "Zona horaria: $ZONA"
 fi
 
 if [ $APPS = 1 ]; then
