@@ -27,8 +27,11 @@ Con `--limpiar`:
 4. **Borra las APK de preinstalación**, para que un reset de fábrica no devuelva las apps piratas.
 5. Vuelve a poner la **verificación de internet** de Google, si el fabricante la cambió por otra.
 6. **Fija la MAC del Wi-Fi** si el driver lo permite. Algunos equipos inventan una MAC en cada arranque y cambian de IP.
-7. **Instala [Vidrio Launcher](apks/)** y lo deja como pantalla de inicio: un launcher liviano (60 KB), sin publicidad ni recomendaciones, con reloj, clima, fútbol en vivo y fondos de astronomía. Se evita con `--sin-launcher`.
-8. **Reinicia y verifica** que nada haya vuelto.
+7. **Instala las apps de base:** WebView 138 de Google si el de fábrica es viejo (con el arreglo para que Android 9 no lo desinstale solo), TV Bro desde su página oficial, y Spotify y TuneIn desde el Play Store de la tele, donde hay que apretar Instalar con el control. Se evita con `--sin-apps`.
+8. **Instala [Vidrio Launcher](apks/)** y lo deja como pantalla de inicio: un launcher liviano (60 KB), sin publicidad ni recomendaciones, con reloj, clima, fútbol en vivo y fondos de astronomía. Se evita con `--sin-launcher`.
+9. **Reinicia y verifica** que nada haya vuelto.
+
+Saca una captura de la tele al empezar y otra al terminar (`antes.png` y `despues.png` en la carpeta del informe).
 
 Todo archivo que modifica se copia antes a `informes/<fecha>-<equipo>/cuarentena/` en tu computadora.
 

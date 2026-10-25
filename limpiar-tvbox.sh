@@ -19,6 +19,7 @@ OPTIMIZAR=0
 CERRAR_ADB=0
 REINICIAR=1
 LAUNCHER=1
+APPS=1
 
 ayuda() {
   cat <<'EOF'
@@ -35,6 +36,8 @@ Sin opciones, busca el equipo en la red y lo ANALIZA: no cambia nada.
   --optimizar       Con --limpiar: animaciones más rápidas y TalkBack apagado si no se usa.
   --cerrar-adb      Con --limpiar: al terminar, cierra el ADB por red (recomendado si no vas a
                     volver a entrar; abierto, cualquiera en tu red puede tener root).
+  --sin-apps        Con --limpiar: no instala las apps de base (WebView al día, TV Bro, Spotify y
+                    TuneIn).
   --sin-launcher    Con --limpiar: no instala Vidrio Launcher (por defecto se instala y queda
                     como pantalla de inicio).
   --sin-reinicio    No reinicia al final para verificar.
@@ -55,6 +58,7 @@ while [ $# -gt 0 ]; do
     --quitar-apps) QUITAR_APPS=1 ;;
     --optimizar) OPTIMIZAR=1 ;;
     --cerrar-adb) CERRAR_ADB=1 ;;
+    --sin-apps) APPS=0 ;;
     --sin-launcher) LAUNCHER=0 ;;
     --sin-reinicio) REINICIAR=0 ;;
     -h|--ayuda|--help) ayuda; exit 0 ;;
@@ -67,7 +71,7 @@ paso() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 aviso() { printf '  %s\n' "$*"; }
 fallar() { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
-for c in adb nc; do
+for c in adb nc curl; do
   command -v $c >/dev/null || fallar "Falta '$c'. En macOS: brew install android-platform-tools. En Linux: apt install adb netcat-openbsd."
 done
 [ -f "$DIR/dispositivo.sh" ] && [ -f "$DIR/indicadores.txt" ] || fallar "Faltan dispositivo.sh o indicadores.txt junto a este script."
@@ -198,6 +202,92 @@ seguir_informe() {
   return 1
 }
 
+# Captura de la pantalla de la tele, para el antes y el después.
+capturar() {
+  adb -s "$D" exec-out screencap -p > "$SALIDA/$1.png" 2>/dev/null && aviso "Captura: $SALIDA/$1.png"
+}
+
+instalado() {
+  adb -s "$D" shell "pm path $1" 2>/dev/null | grep -q package:
+}
+
+# El WebView de fábrica de estos equipos es viejísimo (Chrome 66 a 93): las apps y las páginas
+# modernas se ven rotas. Se instala el de Google 138, el último para Android 8 y 9. No hace
+# falta verificar la descarga: Android solo acepta la actualización si viene firmada como el
+# WebView de Google que trae el sistema.
+instalar_webview() {
+  local v sdk abi
+  v=$(adb -s "$D" shell "dumpsys package com.google.android.webview | grep -m1 versionName" | tr -d '\r' | sed 's/.*=//')
+  sdk=$(adb -s "$D" shell getprop ro.build.version.sdk | tr -dc '0-9')
+  abi=$(adb -s "$D" shell getprop ro.product.cpu.abi | tr -d '\r')
+  if [ "${v%%.*}" -ge 100 ] 2>/dev/null; then aviso "✓ WebView $v, al día"; return; fi
+  if [ "$sdk" != 26 ] && [ "$sdk" != 27 ] && [ "$sdk" != 28 ]; then aviso "WebView: no es Android 8 o 9 (sdk $sdk); lo dejo como está."; return; fi
+  if [ "$abi" != armeabi-v7a ]; then aviso "WebView: procesador $abi; esta versión es para armeabi-v7a, lo dejo como está."; return; fi
+
+  aviso "WebView $v: bajando el 138 de Google (91 MB)…"
+  # APKPure entrega un enlace firmado por pedido; el código de versión 720417900 es armeabi-v7a.
+  local url apk="$SALIDA/webview.apk"
+  url=$(curl -s --max-time 30 'https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=com.google.android.webview' \
+        -H 'x-cv: 3172501' -H "x-sv: $sdk" -H 'x-abis: armeabi-v7a,armeabi' -H 'x-gp: 1' \
+      | LC_ALL=C grep -aoE 'https://data\.winudf\.com/APK/Y29tLmdvb2dsZS5hbmRyb2lkLndlYnZpZXdfNzIwNDE3OTAw[A-Za-z0-9]*\?filename=[^&]*&k=[0-9a-f]+&package_name=com\.google\.android\.webview&token=[0-9]+-[0-9a-f]+-[0-9]+-[0-9a-f]{32}' | head -1)
+  if [ -z "$url" ] || ! curl -sL --max-time 600 -o "$apk" "$url"; then aviso "WebView: no pude bajarlo; lo dejo como está."; return; fi
+
+  adb -s "$D" push "$apk" /data/local/tmp/webview.apk >/dev/null 2>&1 || { aviso "WebView: no pude copiarlo al equipo."; return; }
+  rm -f "$apk"
+  # Android 9 le desinstala la actualización al WebView si Chrome también sirve de WebView
+  # ("fallback logic"); hay que apagar eso antes de instalar.
+  adb -s "$D" shell "cmd webviewupdate enable-redundant-packages" >/dev/null 2>&1
+  # Instalado desde adentro y en segundo plano: un APK grande corta el ADB por Wi-Fi.
+  adb -s "$D" shell "rm -f /data/local/tmp/webview.log; nohup sh -c 'pm install -r -d /data/local/tmp/webview.apk > /data/local/tmp/webview.log 2>&1; echo FIN >> /data/local/tmp/webview.log' >/dev/null 2>&1 &" >/dev/null 2>&1
+  local r=""
+  for _ in $(seq 1 60); do
+    sleep 5
+    r=$(adb -s "$D" shell "cat /data/local/tmp/webview.log 2>/dev/null" | tr -d '\r')
+    case $r in *FIN*) break ;; "") reconectar ;; esac
+  done
+  adb -s "$D" shell "rm -f /data/local/tmp/webview.apk /data/local/tmp/webview.log" >/dev/null 2>&1
+  case $r in *Success*) ;; *) aviso "WebView: Android no lo aceptó (${r%%FIN*}); queda el de fábrica."; return ;; esac
+  adb -s "$D" shell "pm enable com.google.android.webview; cmd webviewupdate set-webview-implementation com.google.android.webview; pm disable-user --user 0 com.android.chrome" >/dev/null 2>&1
+  aviso "✓ WebView 138 instalado y activo (Chrome viejo desactivado)"
+}
+
+# TV Bro: navegador para el control remoto, desde su página oficial en GitHub. La versión sin
+# motor propio usa el WebView del sistema: pesa 7 MB en vez de 60.
+instalar_tvbro() {
+  instalado com.phlox.tvwebbrowser && { aviso "✓ TV Bro ya estaba"; return; }
+  local apk="$SALIDA/tvbro.apk"
+  if curl -sL --max-time 300 -o "$apk" https://github.com/truefedex/tv-bro/releases/download/v2.1.6/tvbro-2.1.6-generic-geckoExcluded.apk \
+     && con_limite 180 adb -s "$D" install -r "$apk" >/dev/null 2>&1; then
+    aviso "✓ TV Bro instalado"
+  else
+    aviso "TV Bro: no pude instalarlo."
+  fi
+  rm -f "$apk"
+}
+
+# Spotify y TuneIn vienen del Play Store del equipo: se abre su página y se espera a que alguien
+# apriete Instalar con el control. Hace falta una cuenta de Google iniciada.
+instalar_de_la_tienda() {
+  local pkg=$1 nombre=$2
+  instalado "$pkg" && { aviso "✓ $nombre ya estaba"; return; }
+  adb -s "$D" shell "am start -a android.intent.action.VIEW -d market://details?id=$pkg" >/dev/null 2>&1
+  aviso "En la tele: apretá Instalar en $nombre (espero hasta 4 minutos)…"
+  for _ in $(seq 1 48); do
+    sleep 5
+    instalado "$pkg" && { aviso "✓ $nombre instalado"; return; }
+  done
+  aviso "$nombre: no se instaló; queda para después, desde el Play Store."
+}
+
+instalar_apps() {
+  adb -s "$D" shell "pm enable com.android.vending" >/dev/null 2>&1
+  instalar_webview
+  instalar_tvbro
+  instalar_de_la_tienda com.spotify.tv.android Spotify
+  instalar_de_la_tienda tunein.player TuneIn
+  adb -s "$D" shell "input keyevent HOME" >/dev/null 2>&1
+}
+
 # Vidrio Launcher: liviano, sin publicidad ni recomendaciones, en apks/. Queda como pantalla de
 # inicio; el permiso DUMP es para su tarjeta de música en equipos que se declaran de poca memoria.
 instalar_launcher() {
@@ -209,6 +299,7 @@ instalar_launcher() {
   fi
   adb -s "$D" shell "cmd package set-home-activity com.augusto.vidrio/.MainActivity" >/dev/null 2>&1
   adb -s "$D" shell "pm grant com.augusto.vidrio android.permission.DUMP" >/dev/null 2>&1
+  adb -s "$D" shell "am start -a android.intent.action.MAIN -c android.intent.category.HOME" >/dev/null 2>&1
   aviso "✓ Vidrio Launcher instalado y elegido como pantalla de inicio."
 }
 
@@ -226,6 +317,7 @@ frenar_conocidos
 MODELO=$(adb -s "$D" shell getprop ro.product.model | tr -d '\r' | tr -c 'A-Za-z0-9_-' '_')
 SALIDA="$DIR/informes/$(date +%Y%m%d-%H%M)-${MODELO:-equipo}"
 mkdir -p "$SALIDA"
+capturar antes
 
 paso "3. $( [ $MODO = limpiar ] && echo Limpiando || echo Analizando ) (corre dentro del equipo; si el ADB se corta, sigue igual)"
 rsh "rm -rf $REMOTO; mkdir -p $REMOTO; chmod 777 $REMOTO" >/dev/null
@@ -248,13 +340,18 @@ if [ $MODO = analizar ]; then
   exit 0
 fi
 
+if [ $APPS = 1 ]; then
+  paso "5. Apps de base"
+  instalar_apps
+fi
+
 if [ $LAUNCHER = 1 ]; then
-  paso "5. Instalando Vidrio Launcher"
+  paso "6. Instalando Vidrio Launcher"
   instalar_launcher
 fi
 
 if [ $REINICIAR = 1 ]; then
-  paso "6. Reiniciando para verificar"
+  paso "7. Reiniciando para verificar"
   adb -s "$D" reboot >/dev/null 2>&1
   sleep 25
   # Si la MAC no se pudo fijar, puede volver con otra IP.
@@ -283,6 +380,10 @@ if [ $CERRAR_ADB = 1 ]; then
   rsh "settings put global adb_enabled 0" >/dev/null 2>&1
   aviso "Para volver a entrar: Opciones de desarrollador → Depuración USB."
 fi
+
+adb -s "$D" shell "input keyevent HOME" >/dev/null 2>&1
+sleep 8
+capturar despues
 
 paso "Listo."
 aviso "Si el equipo tuvo cuentas iniciadas (Google, Netflix, etc.), cambiá esas contraseñas desde otro dispositivo."
